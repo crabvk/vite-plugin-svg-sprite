@@ -1,5 +1,6 @@
 import fs from 'node:fs'
 import path from 'node:path'
+import { createHash } from 'node:crypto'
 import { JSDOM } from 'jsdom'
 import { watch } from 'chokidar'
 import { optimize, type Config as SvgoConfig } from 'svgo'
@@ -10,7 +11,7 @@ interface PluginOptions {
   symbolId?: string
   inject?: 'body-last' | 'body-first'
   svgoConfig?: SvgoConfig
-  filePath?: string
+  fileName?: string
   attributes?: Record<string, string>
 }
 
@@ -38,10 +39,25 @@ const DEFAULT_SVGO_CONFIG: SvgoConfig = {
   ],
 }
 
-function makeSymbolId(template: string, filePath: string) {
+function getHash(content: string) {
+  return createHash('md5')
+    .update(content)
+    .digest('base64')
+    .replace(/[^a-zA-Z0-9]/g, '_')
+    .slice(0, 8)
+}
+
+function resolveFilePath(pattern: string, content: string) {
+  if (pattern.includes('[hash]')) {
+    return pattern.replace('[hash]', getHash(content))
+  }
+  return pattern
+}
+
+function makeSymbolId(pattern: string, filePath: string) {
   const { dir, name } = path.parse(filePath)
   const dirName = path.basename(path.resolve(CWD, dir))
-  return template.replace('[dir]', dirName).replace('[name]', name)
+  return pattern.replace('[dir]', dirName).replace('[name]', name)
 }
 
 function findSvgFiles(dir: string) {
@@ -62,19 +78,21 @@ function findSvgFiles(dir: string) {
   return svgs
 }
 
-function writeSpriteToFile(dir: string, filePath: string, sprite: JSDOM) {
+function writeSpriteToFile(dir: string, pattern: string, sprite: JSDOM) {
+  const content = sprite.serialize()
+  const filePath = resolveFilePath(pattern, content)
   const fullPath = path.join(dir, filePath)
-  const spriteContent = `${sprite.serialize()}\n`
+  const fileContent = `${content}\n`
 
   try {
     if (fs.existsSync(fullPath)) {
       const existingContent = fs.readFileSync(fullPath, 'utf-8')
-      if (existingContent === spriteContent) {
+      if (existingContent === fileContent) {
         return
       }
     }
     fs.mkdirSync(path.dirname(fullPath), { recursive: true })
-    fs.writeFileSync(fullPath, spriteContent)
+    fs.writeFileSync(fullPath, fileContent)
     console.info(`SVG sprite saved in ${fullPath}`)
   } catch (error) {
     console.error(`Error writing sprite file: ${fullPath}`, error)
@@ -103,7 +121,7 @@ export default function svgSprite({
   symbolId = DEFAULT_SYMBOL_ID,
   svgoConfig = DEFAULT_SVGO_CONFIG,
   inject,
-  filePath: fileName,
+  fileName,
   attributes,
 }: PluginOptions): Plugin {
   if (!symbolId.includes('[name]')) {
@@ -113,50 +131,54 @@ export default function svgSprite({
     svgoConfig.multipass = true
   }
   let spriteDom: JSDOM
-  const svgCache = new Map<string, HTMLElement>()
   let watcher: ReturnType<typeof watch> | null = null
   let hasGeneratedSprite = false
   let resolvedConfig: ResolvedConfig | null = null
+  const svgCache = new Map<string, HTMLElement>()
+  const dirs = Array.isArray(include) ? include : [include]
 
   async function generateSvgSprite() {
     const dom = new JSDOM('<svg></svg>', { contentType: 'text/xml' })
     const { document } = dom.window
     const sprite = document.querySelector('svg')!
+    const files: string[] = []
+
+    // Maintain the order of files in the output sprite to ensure consistent hashing.
+    for (const dir of dirs) {
+      for (const file of findSvgFiles(dir)) {
+        files.push(file)
+      }
+    }
 
     await Promise.all(
-      [include].flat().map(async (dir) => {
-        const svgFiles = findSvgFiles(dir)
-        await Promise.all(
-          svgFiles.map(async (filePath) => {
-            try {
-              if (!svgCache.has(filePath)) {
-                const svgContent = await fs.promises.readFile(filePath, 'utf-8')
-                const optimizedSvg = optimize(svgContent, svgoConfig).data
-
-                const fragment = JSDOM.fragment(optimizedSvg)
-                const svg = fragment.querySelector('svg')
-                if (!svg) {
-                  throw new Error(`No SVG element found in ${filePath}`)
-                }
-
-                const symbol = document.createElement('symbol')
-                for (const attr of svg.attributes) {
-                  symbol.setAttribute(attr.name, attr.value)
-                }
-                symbol.setAttribute('id', makeSymbolId(symbolId, filePath))
-                symbol.innerHTML = svg.innerHTML
-
-                svgCache.set(filePath, symbol)
-              }
-
-              sprite.appendChild(svgCache.get(filePath)!)
-            } catch (error) {
-              console.error(`Error reading or processing SVG file ${filePath}`, error)
-            }
-          }),
-        )
+      files.map(async (file) => {
+        try {
+          if (svgCache.has(file)) {
+            return
+          }
+          const svgContent = await fs.promises.readFile(file, 'utf-8')
+          const optimizedSvg = optimize(svgContent, svgoConfig).data
+          const fragment = JSDOM.fragment(optimizedSvg)
+          const svg = fragment.querySelector('svg')
+          if (!svg) {
+            throw new Error(`No SVG element found in ${file}`)
+          }
+          const symbol = document.createElement('symbol')
+          for (const attr of svg.attributes) {
+            symbol.setAttribute(attr.name, attr.value)
+          }
+          symbol.setAttribute('id', makeSymbolId(symbolId, file))
+          symbol.innerHTML = svg.innerHTML
+          svgCache.set(file, symbol)
+        } catch (error) {
+          console.error(`Error reading or processing SVG file ${file}`, error)
+        }
       }),
     )
+
+    for (const file of files) {
+      sprite.appendChild(svgCache.get(file)!)
+    }
 
     sprite.setAttribute('xmlns', SVG_NS)
     if (attributes) {
@@ -184,9 +206,9 @@ export default function svgSprite({
 
       // Set up watcher only in watch mode.
       if (!watcher && isWatchMode) {
-        const absolutePaths = [include]
-          .flat()
-          .map((dir) => (path.isAbsolute(dir) ? dir : path.resolve(CWD, dir)))
+        const absolutePaths = dirs.map((dir) =>
+          path.isAbsolute(dir) ? dir : path.resolve(CWD, dir),
+        )
 
         watcher = createWatcher(absolutePaths, async (filePath) => {
           if (!filePath.endsWith('.svg')) {
@@ -196,9 +218,9 @@ export default function svgSprite({
             svgCache.clear()
             await generateSvgSprite()
 
-            if (fileName) {
+            if (filePath) {
               const { outDir, assetsDir } = config.build
-              writeSpriteToFile(path.join(outDir, assetsDir), fileName, spriteDom)
+              writeSpriteToFile(path.join(outDir, assetsDir), filePath, spriteDom)
             }
 
             // Touch entry file to trigger rebuild.
@@ -235,7 +257,7 @@ export default function svgSprite({
 
     configureServer(server) {
       // Watch SVG files in dev mode.
-      for (const dir of include) {
+      for (const dir of dirs) {
         const absolutePath = path.isAbsolute(dir) ? dir : path.resolve(process.cwd(), dir)
         server.watcher.add(path.join(absolutePath, '**/*.svg'))
       }
