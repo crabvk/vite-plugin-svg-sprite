@@ -7,7 +7,9 @@
   "linter": {
     "rules": {
       "style": {
-        "noUselessElse": "on"
+        "noUselessElse": "on",
+        "useBlockStatements": "on",
+        "noNonNullAssertion": "off"
       }
     }
   },

@@ -22,13 +22,14 @@
     "vite": "^6 || ^7"
   },
   "dependencies": {
-    "cheerio": "^1.0.0",
     "chokidar": "^4.0.1",
+    "jsdom": "^26.1.0",
     "svgo": "^4.0.0",
     "typescript": "^5.4.5"
   },
   "devDependencies": {
     "@biomejs/biome": "2.0.6",
+    "@types/jsdom": "^21.1.7",
     "@types/node": "^24.0.10"
   }
 }

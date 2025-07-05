@@ -1,6 +1,6 @@
 import fs from 'node:fs'
 import path from 'node:path'
-import * as cheerio from 'cheerio'
+import { JSDOM } from 'jsdom'
 import { watch } from 'chokidar'
 import { optimize, type Config as SvgoConfig } from 'svgo'
 import type { Plugin, ResolvedConfig } from 'vite'
@@ -8,27 +8,29 @@ import type { Plugin, ResolvedConfig } from 'vite'
 interface PluginOptions {
   include: string | string[]
   symbolId?: string
-  svgDomId?: string
   inject?: 'body-last' | 'body-first'
   svgoConfig?: SvgoConfig
   filePath?: string
+  attributes?: Record<string, string>
 }
 
 const CWD = process.cwd()
 const VIRTUAL_MODULE_ID = 'virtual:svg-sprite'
 const RESOLVED_VIRTUAL_MODULE_ID = `\0${VIRTUAL_MODULE_ID}`
 const DEFAULT_SYMBOL_ID = '[dir]-[name]'
-const STYLE = 'position:absolute;width:0;height:0;'
+const SVG_NS = 'http://www.w3.org/2000/svg'
 const DEFAULT_SVGO_CONFIG: SvgoConfig = {
   plugins: [
     {
       name: 'preset-default',
       params: {
         overrides: {
-          cleanupIds: {
-            minify: false,
-          },
+          // Keep the original SVG structure.
           mergePaths: false,
+          // Force to remove legal comments.
+          removeComments: {
+            preservePatterns: false,
+          },
         },
       },
     },
@@ -60,21 +62,20 @@ function findSvgFiles(dir: string) {
   return svgs
 }
 
-function writeSpriteToFile(assetsDir: string, filePath: string, spriteContent: string) {
-  const fullPath = path.join(assetsDir, filePath)
-  const finalSpriteContent = `${spriteContent.trim()}\n`
+function writeSpriteToFile(dir: string, filePath: string, sprite: JSDOM) {
+  const fullPath = path.join(dir, filePath)
+  const spriteContent = `${sprite.serialize()}\n`
 
   try {
     if (fs.existsSync(fullPath)) {
       const existingContent = fs.readFileSync(fullPath, 'utf-8')
-      if (existingContent === finalSpriteContent) {
+      if (existingContent === spriteContent) {
         return
       }
     }
-
     fs.mkdirSync(path.dirname(fullPath), { recursive: true })
-    fs.writeFileSync(fullPath, finalSpriteContent)
-    console.info(`SVG sprite saved in ${assetsDir}`)
+    fs.writeFileSync(fullPath, spriteContent)
+    console.info(`SVG sprite saved in ${fullPath}`)
   } catch (error) {
     console.error(`Error writing sprite file: ${fullPath}`, error)
   }
@@ -100,24 +101,27 @@ function createWatcher(paths: string[], onChange: (path: string) => void) {
 export default function svgSprite({
   include,
   symbolId = DEFAULT_SYMBOL_ID,
-  svgDomId = 'svg-sprite',
   svgoConfig = DEFAULT_SVGO_CONFIG,
   inject,
   filePath: fileName,
+  attributes,
 }: PluginOptions): Plugin {
   if (!symbolId.includes('[name]')) {
     throw new Error('Option symbolId must contain [name] substring.')
   }
-
-  let spriteContent = ''
-  const svgCache = new Map<string, string>()
-  let collectedDefs = ''
+  if (!Object.hasOwn(svgoConfig, 'multipass')) {
+    svgoConfig.multipass = true
+  }
+  let spriteDom: JSDOM
+  const svgCache = new Map<string, HTMLElement>()
   let watcher: ReturnType<typeof watch> | null = null
   let hasGeneratedSprite = false
   let resolvedConfig: ResolvedConfig | null = null
 
   async function generateSvgSprite() {
-    let svgSymbols = ''
+    const dom = new JSDOM('<svg></svg>', { contentType: 'text/xml' })
+    const { document } = dom.window
+    const sprite = document.querySelector('svg')!
 
     await Promise.all(
       [include].flat().map(async (dir) => {
@@ -125,58 +129,44 @@ export default function svgSprite({
         await Promise.all(
           svgFiles.map(async (filePath) => {
             try {
-              const svgContent = await fs.promises.readFile(filePath, 'utf-8')
               if (!svgCache.has(filePath)) {
-                const optimizedSvg = optimize(svgContent, {
-                  ...svgoConfig,
-                  multipass: true,
-                }).data
+                const svgContent = await fs.promises.readFile(filePath, 'utf-8')
+                const optimizedSvg = optimize(svgContent, svgoConfig).data
 
-                const $ = cheerio.load(optimizedSvg, { xmlMode: true })
-                const $svg = $('svg')
-                const viewBox = $svg.attr('viewBox') || '0 0 24 24'
-
-                // Create symbol with all original SVG attributes except width and height.
-                const $symbol = $('<symbol></symbol>')
-                  .attr('id', makeSymbolId(symbolId, filePath))
-                  .attr('viewBox', viewBox)
-
-                // Copy all attributes from SVG except width and height.
-                const attrs = $svg[0].attribs
-                for (const [key, value] of Object.entries(attrs)) {
-                  if (key !== 'width' && key !== 'height') {
-                    $symbol.attr(key, value)
-                  }
+                const fragment = JSDOM.fragment(optimizedSvg)
+                const svg = fragment.querySelector('svg')
+                if (!svg) {
+                  throw new Error(`No SVG element found in ${filePath}`)
                 }
 
-                $symbol.append($svg.children())
-
-                const $defs = $svg.find('defs')
-                if ($defs.length > 0) {
-                  collectedDefs += $defs.html()
+                const symbol = document.createElement('symbol')
+                for (const attr of svg.attributes) {
+                  symbol.setAttribute(attr.name, attr.value)
                 }
+                symbol.setAttribute('id', makeSymbolId(symbolId, filePath))
+                symbol.innerHTML = svg.innerHTML
 
-                svgCache.set(filePath, $.html($symbol))
+                svgCache.set(filePath, symbol)
               }
 
-              svgSymbols += svgCache.get(filePath)
+              sprite.appendChild(svgCache.get(filePath)!)
             } catch (error) {
-              console.error(`Error reading or processing SVG file: ${filePath}`, error)
+              console.error(`Error reading or processing SVG file ${filePath}`, error)
             }
           }),
         )
       }),
     )
 
-    if (svgSymbols.length > 0) {
-      const defsContent = collectedDefs ? `<defs>${collectedDefs}</defs>` : ''
-      spriteContent = `<svg xmlns="http://www.w3.org/2000/svg" style="${STYLE}" id="${svgDomId}">${defsContent}${svgSymbols}</svg>`
-    } else {
-      console.warn('No SVG symbols were generated.')
-      spriteContent = `<svg xmlns="http://www.w3.org/2000/svg" style="${STYLE}" id="${svgDomId}"></svg>`
+    sprite.setAttribute('xmlns', SVG_NS)
+    if (attributes) {
+      for (const [name, value] of Object.entries(attributes)) {
+        sprite.setAttribute(name, value)
+      }
     }
 
-    return spriteContent
+    spriteDom = dom
+    return dom
   }
 
   return {
@@ -199,15 +189,16 @@ export default function svgSprite({
           .map((dir) => (path.isAbsolute(dir) ? dir : path.resolve(CWD, dir)))
 
         watcher = createWatcher(absolutePaths, async (filePath) => {
-          if (!filePath.endsWith('.svg')) return
+          if (!filePath.endsWith('.svg')) {
+            return
+          }
           try {
             svgCache.clear()
-            collectedDefs = ''
             await generateSvgSprite()
 
             if (fileName) {
-              const { assetsDir } = config.build
-              writeSpriteToFile(assetsDir, fileName, spriteContent)
+              const { outDir, assetsDir } = config.build
+              writeSpriteToFile(path.join(outDir, assetsDir), fileName, spriteDom)
             }
 
             // Touch entry file to trigger rebuild.
@@ -253,7 +244,6 @@ export default function svgSprite({
       const handleDevChange = async () => {
         try {
           svgCache.clear()
-          collectedDefs = ''
           await generateSvgSprite()
 
           // Invalidate virtual module and reload.
@@ -263,7 +253,7 @@ export default function svgSprite({
             server.ws.send({ type: 'full-reload' })
           }
         } catch (error) {
-          console.error('❌ Error handling SVG change:', error)
+          console.error('Error handling SVG change:', error)
         }
       }
 
@@ -294,7 +284,7 @@ export default function svgSprite({
     load(id) {
       if (id === RESOLVED_VIRTUAL_MODULE_ID) {
         return `
-          const sprite = ${JSON.stringify(spriteContent)}
+          const sprite = ${JSON.stringify(spriteDom.serialize())}
           export default sprite
         `
       }
@@ -302,15 +292,23 @@ export default function svgSprite({
 
     transformIndexHtml(html: string) {
       if (inject) {
-        const $ = cheerio.load(html)
+        const dom = new JSDOM(html)
+        const { document } = dom.window
+        const svg = spriteDom.window.document.querySelector('svg')!
         switch (inject) {
-          case 'body-first':
-            $('body').prepend(spriteContent)
+          case 'body-first': {
+            document.querySelector('body')?.prepend(svg)
             break
-          default:
-            $('body').append(spriteContent)
+          }
+          case 'body-last': {
+            document.querySelector('body')?.appendChild(svg)
+            break
+          }
+          default: {
+            throw new Error(`Unknown inject option value: ${inject}`)
+          }
         }
-        return $.html()
+        return dom.serialize()
       }
       return html
     },
@@ -321,8 +319,8 @@ export default function svgSprite({
       }
       // Write sprite file during bundle generation.
       if (fileName && !hasGeneratedSprite) {
-        const { assetsDir } = resolvedConfig.build
-        writeSpriteToFile(assetsDir, fileName, spriteContent)
+        const { outDir, assetsDir } = resolvedConfig.build
+        writeSpriteToFile(path.join(outDir, assetsDir), fileName, spriteDom)
         // Mark that we've generated the sprite to prevent multiple writes.
         hasGeneratedSprite = true
       }
