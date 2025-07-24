@@ -39,20 +39,38 @@ const DEFAULT_SVGO_CONFIG: SvgoConfig = {
   ],
 }
 
-function getHash(content: string) {
-  return createHash('md5')
+const getHash = (content: string) =>
+  createHash('md5')
     .update(content)
     .digest('base64')
     .replace(/[^a-zA-Z0-9]/g, '_')
     .slice(0, 8)
+
+class SvgSprite {
+  #dom: JSDOM
+  #content: string
+  #hash: string
+
+  constructor(dom: JSDOM) {
+    this.#dom = dom
+    this.#content = dom.serialize()
+    this.#hash = getHash(this.#content)
+  }
+
+  get svg() {
+    return this.#dom.window.document.querySelector('svg')!
+  }
+
+  get content() {
+    return this.#content
+  }
+
+  get hash() {
+    return this.#hash
+  }
 }
 
-function resolveFilePath(pattern: string, content: string) {
-  if (pattern.includes('[hash]')) {
-    return pattern.replace('[hash]', getHash(content))
-  }
-  return pattern
-}
+const resolveFileName = (pattern: string, hash: string) => pattern.replace('[hash]', hash)
 
 function makeSymbolId(pattern: string, filePath: string) {
   const { dir, name } = path.parse(filePath)
@@ -78,24 +96,23 @@ function findSvgFiles(dir: string) {
   return svgs
 }
 
-function writeSpriteToFile(dir: string, pattern: string, sprite: JSDOM) {
-  const content = sprite.serialize()
-  const filePath = resolveFilePath(pattern, content)
-  const fullPath = path.join(dir, filePath)
-  const fileContent = `${content}\n`
+function writeSpriteToFile(dir: string, pattern: string, sprite: SvgSprite) {
+  const fileName = resolveFileName(pattern, sprite.hash)
+  const filePath = path.join(dir, fileName)
+  const fileContent = `${sprite.content}\n`
 
   try {
-    if (fs.existsSync(fullPath)) {
-      const existingContent = fs.readFileSync(fullPath, 'utf-8')
+    if (fs.existsSync(filePath)) {
+      const existingContent = fs.readFileSync(filePath, 'utf-8')
       if (existingContent === fileContent) {
         return
       }
     }
-    fs.mkdirSync(path.dirname(fullPath), { recursive: true })
-    fs.writeFileSync(fullPath, fileContent)
-    console.info(`SVG sprite saved in ${fullPath}`)
+    fs.mkdirSync(path.dirname(filePath), { recursive: true })
+    fs.writeFileSync(filePath, fileContent)
+    console.info(`SVG sprite saved to ${filePath}`)
   } catch (error) {
-    console.error(`Error writing sprite file: ${fullPath}`, error)
+    console.error(`Error writing sprite to ${filePath}`, error)
   }
 }
 
@@ -130,7 +147,7 @@ export default function svgSprite({
   if (!Object.hasOwn(svgoConfig, 'multipass')) {
     svgoConfig.multipass = true
   }
-  let spriteDom: JSDOM
+  let svgSprite: SvgSprite
   let watcher: ReturnType<typeof watch> | null = null
   let hasGeneratedSprite = false
   let resolvedConfig: ResolvedConfig | null = null
@@ -187,8 +204,14 @@ export default function svgSprite({
       }
     }
 
-    spriteDom = dom
-    return dom
+    svgSprite = new SvgSprite(dom)
+  }
+
+  function getConfig() {
+    if (resolvedConfig === null) {
+      throw new Error('Unreachable.')
+    }
+    return resolvedConfig
   }
 
   return {
@@ -220,7 +243,7 @@ export default function svgSprite({
 
             if (filePath) {
               const { outDir, assetsDir } = config.build
-              writeSpriteToFile(path.join(outDir, assetsDir), filePath, spriteDom)
+              writeSpriteToFile(path.join(outDir, assetsDir), filePath, svgSprite)
             }
 
             // Touch entry file to trigger rebuild.
@@ -228,7 +251,7 @@ export default function svgSprite({
               // Get entry file from Vite config.
               let entry: string | undefined
 
-              if (config.build.lib && typeof config.build.lib === 'object') {
+              if (typeof config.build.lib === 'object') {
                 if (typeof config.build.lib.entry === 'string') {
                   entry = config.build.lib.entry
                 } else if (Array.isArray(config.build.lib.entry)) {
@@ -256,7 +279,7 @@ export default function svgSprite({
     },
 
     configureServer(server) {
-      // Watch SVG files in dev mode.
+      // Watch SVG files in development.
       for (const dir of dirs) {
         const absolutePath = path.isAbsolute(dir) ? dir : path.resolve(process.cwd(), dir)
         server.watcher.add(path.join(absolutePath, '**/*.svg'))
@@ -287,6 +310,22 @@ export default function svgSprite({
           debounceTimer = setTimeout(handleDevChange, 100)
         }
       })
+
+      // Serve sprite file in development.
+      if (typeof fileName === 'string') {
+        server.middlewares.use((req, res, next) => {
+          const { assetsDir } = getConfig().build
+          const name = resolveFileName(fileName, svgSprite.hash)
+          const filePath = path.join(assetsDir, name)
+          const url = filePath.startsWith('/') ? filePath : `/${filePath}`
+          if (req.url === url) {
+            res.setHeader('content-type', 'image/svg+xml')
+            res.end(svgSprite.content)
+          } else {
+            next()
+          }
+        })
+      }
     },
 
     closeBundle() {
@@ -305,10 +344,19 @@ export default function svgSprite({
 
     load(id) {
       if (id === RESOLVED_VIRTUAL_MODULE_ID) {
-        return `
-          const sprite = ${JSON.stringify(spriteDom.serialize())}
-          export default sprite
+        let code = `
+          export const sprite = ${JSON.stringify(svgSprite.content)}
         `
+        if (typeof fileName === 'string') {
+          const { assetsDir } = getConfig().build
+          const name = resolveFileName(fileName, svgSprite.hash)
+          const filePath = path.join(assetsDir, name)
+          const url = filePath.startsWith('/') ? filePath : `/${filePath}`
+          code += `
+            export const url = ${JSON.stringify(url)}
+          `
+        }
+        return code
       }
     },
 
@@ -316,14 +364,13 @@ export default function svgSprite({
       if (inject) {
         const dom = new JSDOM(html)
         const { document } = dom.window
-        const svg = spriteDom.window.document.querySelector('svg')!
         switch (inject) {
           case 'body-first': {
-            document.querySelector('body')?.prepend(svg)
+            document.querySelector('body')?.prepend(svgSprite.svg)
             break
           }
           case 'body-last': {
-            document.querySelector('body')?.appendChild(svg)
+            document.querySelector('body')?.appendChild(svgSprite.svg)
             break
           }
           default: {
@@ -336,13 +383,10 @@ export default function svgSprite({
     },
 
     generateBundle() {
-      if (resolvedConfig === null) {
-        throw new Error('Unreachable.')
-      }
       // Write sprite file during bundle generation.
       if (fileName && !hasGeneratedSprite) {
-        const { outDir, assetsDir } = resolvedConfig.build
-        writeSpriteToFile(path.join(outDir, assetsDir), fileName, spriteDom)
+        const { outDir, assetsDir } = getConfig().build
+        writeSpriteToFile(path.join(outDir, assetsDir), fileName, svgSprite)
         // Mark that we've generated the sprite to prevent multiple writes.
         hasGeneratedSprite = true
       }

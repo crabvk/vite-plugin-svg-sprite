@@ -31,5 +31,22 @@
     "@biomejs/biome": "2.0.6",
     "@types/jsdom": "^21.1.7",
     "@types/node": "^24.0.10"
-  }
+  },
+  "exports": {
+    ".": {
+      "default": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/index.js"
+      }
+    },
+    "./client": {
+      "default": {
+        "types": "./src/client.d.ts"
+      }
+    }
+  },
+  "files": [
+    "dist",
+    "src/client.d.ts"
+  ]
 }
