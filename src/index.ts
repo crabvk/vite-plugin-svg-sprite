@@ -9,7 +9,7 @@ import type { Plugin, ResolvedConfig } from 'vite'
 interface PluginOptions {
   include: string | string[]
   symbolId?: string
-  inject?: 'body-last' | 'body-first'
+  inject?: 'body-first' | 'body-last'
   svgoConfig?: SvgoConfig
   fileName?: string
   attributes?: Record<string, string>
