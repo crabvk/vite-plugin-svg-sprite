@@ -7,8 +7,7 @@ import { optimize, type Config as SvgoConfig } from 'svgo'
 import type { Plugin, ResolvedConfig } from 'vite'
 
 interface PluginOptions {
-  include: string | string[]
-  symbolId?: string
+  include: string | Record<string, string>
   inject?: 'body-first' | 'body-last'
   svgoConfig?: SvgoConfig
   fileName?: string
@@ -18,7 +17,6 @@ interface PluginOptions {
 const CWD = process.cwd()
 const VIRTUAL_MODULE_ID = 'virtual:svg-sprite'
 const RESOLVED_VIRTUAL_MODULE_ID = `\0${VIRTUAL_MODULE_ID}`
-const DEFAULT_SYMBOL_ID = '[dir]-[name]'
 const SVG_NS = 'http://www.w3.org/2000/svg'
 const DEFAULT_SVGO_CONFIG: SvgoConfig = {
   plugins: [
@@ -71,12 +69,6 @@ class SvgSprite {
 }
 
 const resolveFileName = (pattern: string, hash: string) => pattern.replace('[hash]', hash)
-
-function makeSymbolId(pattern: string, filePath: string) {
-  const { dir, name } = path.parse(filePath)
-  const dirName = path.basename(path.resolve(CWD, dir))
-  return pattern.replace('[dir]', dirName).replace('[name]', name)
-}
 
 function findSvgFiles(dir: string) {
   const files = fs.readdirSync(dir)
@@ -135,15 +127,11 @@ function createWatcher(paths: string[], onChange: (path: string) => void) {
 
 export default function svgSprite({
   include,
-  symbolId = DEFAULT_SYMBOL_ID,
   svgoConfig = DEFAULT_SVGO_CONFIG,
   inject,
   fileName,
   attributes,
 }: PluginOptions): Plugin {
-  if (!symbolId.includes('[name]')) {
-    throw new Error('Option symbolId must contain [name] substring.')
-  }
   if (!Object.hasOwn(svgoConfig, 'multipass')) {
     svgoConfig.multipass = true
   }
@@ -152,49 +140,60 @@ export default function svgSprite({
   let hasGeneratedSprite = false
   let resolvedConfig: ResolvedConfig | null = null
   const svgCache = new Map<string, HTMLElement>()
-  const dirs = Array.isArray(include) ? include : [include]
+  const dirs = typeof include === 'string' ? [include] : Object.values(include)
 
   async function generateSvgSprite() {
     const dom = new JSDOM('<svg></svg>', { contentType: 'text/xml' })
     const { document } = dom.window
     const sprite = document.querySelector('svg')!
-    const files: string[] = []
+    const files: Map<string | null, string[]> = new Map()
+    const tasks: Promise<void>[] = []
 
-    // Maintain the order of files in the output sprite to ensure consistent hashing.
-    for (const dir of dirs) {
-      for (const file of findSvgFiles(dir)) {
-        files.push(file)
+    // The order of files in the output sprite is important to ensure consistent hashing.
+    if (typeof include === 'string') {
+      files.set(null, findSvgFiles(include))
+    } else {
+      for (const [scope, dir] of Object.entries(include)) {
+        files.set(scope, findSvgFiles(dir))
       }
     }
 
-    await Promise.all(
-      files.map(async (file) => {
-        try {
-          if (svgCache.has(file)) {
-            return
+    for (const [scope, paths] of files) {
+      tasks.push(
+        ...paths.map(async (filePath) => {
+          try {
+            if (svgCache.has(filePath)) {
+              return
+            }
+            const svgContent = await fs.promises.readFile(filePath, 'utf-8')
+            const optimizedSvg = optimize(svgContent, svgoConfig).data
+            const fragment = JSDOM.fragment(optimizedSvg)
+            const svg = fragment.querySelector('svg')
+            if (!svg) {
+              throw new Error(`No SVG element found in ${filePath}`)
+            }
+            const symbol = document.createElement('symbol')
+            for (const attr of svg.attributes) {
+              symbol.setAttribute(attr.name, attr.value)
+            }
+            const { name } = path.parse(filePath)
+            const id = scope === null ? name : `${scope}-${name}`
+            symbol.setAttribute('id', id)
+            symbol.innerHTML = svg.innerHTML
+            svgCache.set(filePath, symbol)
+          } catch (error) {
+            console.error(`Error reading or processing SVG file ${filePath}`, error)
           }
-          const svgContent = await fs.promises.readFile(file, 'utf-8')
-          const optimizedSvg = optimize(svgContent, svgoConfig).data
-          const fragment = JSDOM.fragment(optimizedSvg)
-          const svg = fragment.querySelector('svg')
-          if (!svg) {
-            throw new Error(`No SVG element found in ${file}`)
-          }
-          const symbol = document.createElement('symbol')
-          for (const attr of svg.attributes) {
-            symbol.setAttribute(attr.name, attr.value)
-          }
-          symbol.setAttribute('id', makeSymbolId(symbolId, file))
-          symbol.innerHTML = svg.innerHTML
-          svgCache.set(file, symbol)
-        } catch (error) {
-          console.error(`Error reading or processing SVG file ${file}`, error)
-        }
-      }),
-    )
+        }),
+      )
+    }
 
-    for (const file of files) {
-      sprite.appendChild(svgCache.get(file)!)
+    await Promise.all(tasks)
+
+    for (const paths of files.values()) {
+      for (const filePath of paths) {
+        sprite.appendChild(svgCache.get(filePath)!)
+      }
     }
 
     sprite.setAttribute('xmlns', SVG_NS)
