@@ -22,7 +22,7 @@ npm i -D @crabvk/vite-plugin-svg-sprite
 
 Add plugin to your *vite.config.ts*:
 
-```shell
+```typescript
 import svgSprite from '@crabvk/vite-plugin-svg-sprite'
 
 export default {
