@@ -1,5 +1,6 @@
 import fs from 'node:fs'
 import path from 'node:path'
+import { EOL } from 'node:os'
 import { createHash } from 'node:crypto'
 import { JSDOM } from 'jsdom'
 import { watch } from 'chokidar'
@@ -12,6 +13,7 @@ interface PluginOptions {
   svgoConfig?: SvgoConfig
   fileName?: string
   attributes?: Record<string, string>
+  typesDir?: string
 }
 
 const CWD = process.cwd()
@@ -68,6 +70,7 @@ class SvgSprite {
   }
 }
 
+const getFileName = (filePath: string) => path.basename(filePath).slice(0, -4)
 const resolveFileName = (pattern: string, hash: string) => pattern.replace('[hash]', hash)
 
 function findSvgFiles(dir: string) {
@@ -108,6 +111,25 @@ function writeSpriteToFile(dir: string, pattern: string, sprite: SvgSprite) {
   }
 }
 
+async function writeTypeDeclaration(files: Map<string | null, string[]>, typesDir: string) {
+  const props: string[] = []
+  for (const [scope, paths] of files) {
+    const key = scope === null ? '' : scope
+    props.push(
+      `${JSON.stringify(key)}: ${paths.map((p) => JSON.stringify(getFileName(p))).join(' | ')}`,
+    )
+  }
+  const declaration = `
+declare module "@crabvk/vite-plugin-svg-sprite/types" {
+  export interface SymbolId {
+    ${props.join(`${EOL}    `)}
+  }
+}
+`
+  await fs.promises.mkdir(typesDir, { recursive: true })
+  await fs.promises.writeFile(path.join(typesDir, 'vite-plugin-svg-sprite.d.ts'), declaration)
+}
+
 function createWatcher(paths: string[], onChange: (path: string) => void) {
   return watch(paths, {
     ignored: /(^|[\\])\../,
@@ -131,6 +153,7 @@ export default function svgSprite({
   inject,
   fileName,
   attributes,
+  typesDir,
 }: PluginOptions): Plugin {
   if (!Object.hasOwn(svgoConfig, 'multipass')) {
     svgoConfig.multipass = true
@@ -146,8 +169,9 @@ export default function svgSprite({
     const dom = new JSDOM('<svg></svg>', { contentType: 'text/xml' })
     const { document } = dom.window
     const sprite = document.querySelector('svg')!
-    const files: Map<string | null, string[]> = new Map()
+    const files = new Map<string | null, string[]>()
     const tasks: Promise<void>[] = []
+    svgCache.clear()
 
     // The order of files in the output sprite is important to ensure consistent hashing.
     if (typeof include === 'string') {
@@ -176,7 +200,7 @@ export default function svgSprite({
             for (const attr of svg.attributes) {
               symbol.setAttribute(attr.name, attr.value)
             }
-            const { name } = path.parse(filePath)
+            const name = getFileName(filePath)
             const id = scope === null ? name : `${scope}-${name}`
             symbol.setAttribute('id', id)
             symbol.innerHTML = svg.innerHTML
@@ -204,6 +228,10 @@ export default function svgSprite({
     }
 
     svgSprite = new SvgSprite(dom)
+
+    if (typeof typesDir === 'string') {
+      await writeTypeDeclaration(files, typesDir)
+    }
   }
 
   function getConfig() {
@@ -237,7 +265,6 @@ export default function svgSprite({
             return
           }
           try {
-            svgCache.clear()
             await generateSvgSprite()
 
             if (filePath) {
@@ -287,7 +314,6 @@ export default function svgSprite({
       let debounceTimer: NodeJS.Timeout
       const handleDevChange = async () => {
         try {
-          svgCache.clear()
           await generateSvgSprite()
 
           // Invalidate virtual module and reload.
