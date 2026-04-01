@@ -7,3 +7,6 @@ lint:
 build:
     rm -rf ./dist
     pnpm exec tsc --build --noEmit false
+
+publish: build
+    pnpm publish --access public
